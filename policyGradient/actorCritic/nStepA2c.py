@@ -1,167 +1,159 @@
-import argparse
-from statistics import mean
-from collections import deque
+
+import math
+import random
+
 import gym
 import numpy as np
-from itertools import count
-from collections import namedtuple
-import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
 
-def t(x): return torch.from_numpy(x).float()
+from IPython.display import clear_output
+import matplotlib.pyplot as plt
+from common.utils import *
 
-class Actor(nn.Module):
-    def __init__(self, state_dim, n_actions):
-        super().__init__()
-        self.seed = torch.manual_seed(123)
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, n_actions),
-            nn.Softmax()
-        )
-    
-    def forward(self, X):
-        return self.model(X)
+from common.multiprocessing_env import SubprocVecEnv
 
-class Critic(nn.Module):
-    def __init__(self, state_dim):
-        super().__init__()
-        self.seed = torch.manual_seed(123)
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-    
-    def forward(self, X):
-        return self.model(X)
-
-class Memory():
-    def __init__(self):
-        self.log_probs = []
-        self.values = []
-        self.rewards = []
-        self.dones = []
-
-    def add(self, log_prob, value, reward, done):
-        self.log_probs.append(log_prob)
-        self.values.append(value)
-        self.rewards.append(reward)
-        self.dones.append(done)
-    
-    def clear(self):
-        self.log_probs.clear()
-        self.values.clear()
-        self.rewards.clear()
-        self.dones.clear()  
-    
-    def _zip(self):
-        return zip(self.log_probs,
-                self.values,
-                self.rewards,
-                self.dones)
-    
-    def __iter__(self):
-        for data in self._zip():
-            return data
-    
-    def reversed(self):
-        for data in list(self._zip())[::-1]:
-            yield data
-    
-    def __len__(self):
-        return len(self.rewards)
-
-# train function
-def train(memory, q_val):
-    values = torch.stack(memory.values)
-    q_vals = np.zeros((len(memory), 1))
-    
-    # target values are calculated backward
-    # it's super important to handle correctly done states,
-    # for those cases we want our to target to be equal to the reward only
-    for i, (_, _, reward, done) in enumerate(memory.reversed()):
-        q_val = reward + gamma*q_val*(1.0-done)
-        q_vals[len(memory)-1 - i] = q_val # store values from the end to the beginning
+class ActorCritic(nn.Module):
+    def __init__(self, num_inputs, num_outputs, hidden_size, std=0.0):
+        super(ActorCritic, self).__init__()
         
-    advantage = torch.Tensor(q_vals) - values
-    
-    critic_loss = advantage.pow(2).mean()
-    adam_critic.zero_grad()
-    critic_loss.backward()
-    adam_critic.step()
-    actor_loss = (-torch.stack(memory.log_probs)*advantage.detach()).mean()
-    adam_actor.zero_grad()
-    actor_loss.backward()
-    adam_actor.step()
-
-
-
-
-if __name__ == '__main__':
-    # p = Policy()
-    # state = torch.tensor(env.reset()).float()
-    # print(state)
-    # a = p(state)
-    # print(a)
-    # print(a[0].dtype)
-    env = gym.make("CartPole-v1")
-    env.seed(123)
-    state_dim = env.observation_space.shape[0]
-    n_actions = env.action_space.n
-    actor = Actor(state_dim, n_actions)
-    critic = Critic(state_dim)
-    adam_actor = torch.optim.Adam(actor.parameters(), lr=1e-3)
-    adam_critic = torch.optim.Adam(critic.parameters(), lr=1e-3)
-    gamma = 0.99
-    memory = Memory()
-    max_steps = 10
-
-    episode_rewards = []
-
-    for i in range(500):
+        self.critic = nn.Sequential(
+            nn.Linear(num_inputs, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
         
-        done = False
-        total_reward = 0
-        state = env.reset()
-        steps = 0
+        self.actor = nn.Sequential(
+            nn.Linear(num_inputs, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, num_outputs),
+            nn.Softmax(dim=1),
+        )
+        
+    def forward(self, x):
+        value = self.critic(x)
+        probs = self.actor(x)
+        dist  = Categorical(probs)
+        return dist, value
 
-        while not done:
-            probs = actor(t(state))
-            dist = torch.distributions.Categorical(probs=probs)
+use_cuda = torch.cuda.is_available()
+device   = torch.device("cuda" if use_cuda else "cpu")
+
+num_envs = 16
+env_name = "CartPole-v0"
+
+def make_env():
+    def _thunk():
+        env = gym.make(env_name)
+        return env
+
+    return _thunk
+
+envs = make_envs(env_name, num_envs)
+env = gym.make(env_name)
+print(envs.observation_space.shape)
+print(env.observation_space.shape)
+
+
+def plot(frame_idx, rewards):
+    clear_output(True)
+    plt.figure(figsize=(20,5))
+    plt.subplot(131)
+    plt.title('frame %s. reward: %s' % (frame_idx, rewards[-1]))
+    plt.plot(rewards)
+    plt.show()
+    
+def test_env(vis=False):
+    state = env.reset()
+    if vis: env.render()
+    done = False
+    total_reward = 0
+    while not done:
+        state = torch.FloatTensor(state).unsqueeze(0).to(device)
+        dist, _ = model(state)
+        next_state, reward, done, _ = env.step(dist.sample().cpu().numpy()[0])
+        state = next_state
+        if vis: env.render()
+        total_reward += reward
+    return total_reward
+
+
+def compute_returns(next_value, rewards, masks, gamma=0.99):
+    R = next_value
+    returns = []
+    for step in reversed(range(len(rewards))):
+        R = rewards[step] + gamma * R * masks[step]
+        returns.insert(0, R)
+    return returns
+num_inputs  = envs.observation_space.shape[0]
+num_outputs = envs.action_space.n
+
+#Hyper params:
+hidden_size = 256
+lr          = 3e-4
+num_steps   = 5
+
+model = ActorCritic(num_inputs, num_outputs, hidden_size).to(device)
+optimizer = optim.Adam(model.parameters())
+
+max_frames   = 20000
+frame_idx    = 0
+test_rewards = []
+
+if __name__ == "__main__":
+    state = envs.reset()
+    print(state)
+
+    while frame_idx < max_frames:
+
+        log_probs = []
+        values    = []
+        rewards   = []
+        masks     = []
+        entropy = 0
+
+        for _ in range(num_steps):
+            state = torch.FloatTensor(state).to(device)
+            dist, value = model(state)
+
             action = dist.sample()
+            next_state, reward, done, _ = envs.step(action.cpu().numpy())
+
+            log_prob = dist.log_prob(action)
+            entropy += dist.entropy().mean()
             
-            next_state, reward, done, info = env.step(action.item())
-            
-            total_reward += reward
-            steps += 1
-            memory.add(dist.log_prob(action), critic(t(state)), reward, done)
+            log_probs.append(log_prob)
+            values.append(value)
+            rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(device))
+            masks.append(torch.FloatTensor(1 - done).unsqueeze(1).to(device))
             
             state = next_state
+            frame_idx += 1
             
-            # train if done or num steps > max_steps
-            if done or (steps % max_steps == 0):
-                last_q_val = critic(t(next_state)).detach().data.numpy()
-                train(memory, last_q_val)
-                memory.clear()
-        
+            if frame_idx % 1000 == 0:
+                print(frame_idx)
+                test_rewards.append(np.mean([test_env() for _ in range(10)]))
+                plot(frame_idx, test_rewards)
                 
-        episode_rewards.append(total_reward)
-        if i % 10 == 0:
-            print(i, episode_rewards[-1])
+        next_state = torch.FloatTensor(next_state).to(device)
+        _, next_value = model(next_state)
+        returns = compute_returns(next_value, rewards, masks)
+        
+        log_probs = torch.cat(log_probs)
+        returns   = torch.cat(returns).detach()
+        values    = torch.cat(values)
 
-    plt.scatter(np.arange(len(episode_rewards)), episode_rewards, s=2)
-    plt.title("Total reward per episode (episodic)")
-    plt.ylabel("reward")
-    plt.xlabel("episode")
-    plt.show()
+        advantage = returns - values
+
+        actor_loss  = -(log_probs * advantage.detach()).mean()
+        critic_loss = advantage.pow(2).mean()
+
+        loss = actor_loss + 0.5 * critic_loss - 0.001 * entropy
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()

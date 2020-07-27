@@ -1,186 +1,196 @@
-import argparse
-from statistics import mean
-from collections import deque
+import math
+import random
+
 import gym
 import numpy as np
-from itertools import count
-from collections import namedtuple
-import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.distributions import Categorical
-from memory import Memory
-from utils import *
+from common.networks import *
+from common.memory import Memory
+from IPython.display import clear_output
+import matplotlib.pyplot as plt
+from common.utils import *
+from common.multiprocessing_env import SubprocVecEnv
 
-class Actor(nn.Module):
-    def __init__(self, state_dim, n_actions):
-        super().__init__()
-        self.seed = torch.manual_seed(123)
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.Tanh(),
-            nn.Linear(64, 32),
-            nn.Tanh(),
-            nn.Linear(32, n_actions),
-            nn.Softmax()
-        )
+# def epsilonLogDecay(ep):
+#         return max(0, min(1, 1.0 - math.log10((ep  + 1) /  25)))
+
+# def epsilonLinear(self, ep):
+#     return self.linearDecay[ep] if (ep < int(self.EPISODES*self.linearFraction)) else self.min_epsilon
     
-    def forward(self, X):
-        return self.model(X)
-
-class Critic(nn.Module):
-    def __init__(self, state_dim):
-        super().__init__()
-        self.seed = torch.manual_seed(123)
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
-        )
-    
-    def forward(self, X):
-        return self.model(X)
-
-
-class ActorCritic:
-    def __init__(self, env, seed):
+def plot(frame_idx, rewards):
+    clear_output(True)
+    plt.figure(figsize=(20,5))
+    plt.subplot(131)
+    plt.title('frame %s. reward: %s' % (frame_idx, rewards[-1]))
+    plt.plot(rewards)
+    plt.show()
+class ACAgent:
+    def __init__(self, env, envs, hidden_size, env_seed=0, torch_seed=0, ANNEAL_LR=True, device="cpu"):
+        self.device = device
         self.env = env
-        self.seed = seed
-        self.state_dim = self.env.observation_space.shape[0]
-        self.n_actions = self.env.action_space.n
-        self.actor = Actor(self.state_dim, self.n_actions)
-        self.critic = Critic(self.state_dim)
-        self.n_episodes = 500
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=1e-3)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
+        # if env_seed: self.env.seed(env_seed) 
+        self.envs = envs    
+        self.obs_space  = self.envs.observation_space.shape[0]
+        self.action_space = self.envs.action_space.n
+        # self.model = ActorCritic(self.obs_space, self.action_space, hidden_size, torch_seed)
+        self.model = PolicyNet(self.obs_space, self.action_space, hidden_size, seed=torch_seed)
+        self.device = device
+        self.num_steps = 5 
+        self.max_frames = 20_000
+        self.lr = 0.001
+        self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.test_rewards = []
+        #expo decay to 10 percent of initial lr
+        self.percent = 10
         self.memory = Memory()
-        self.reward_history = []
-        self.n_step = 10000
-        self.gamma = 0.99
-        self.regularize = False
-        self.eps = np.finfo(np.float32).eps.item()
-    
-    
-    
-    def select_action(self, state):
-        #neural network expects a 2 dimensional tensor that is a float
-        #not sure if need unsqeueeze
-        probs = self.actor(to_tensor(state))
-        #get probs from the network
-        dist = Categorical(probs)
-        #sample an action with corresponding probability
-        action = dist.sample()
-        #save the log prob, and state_value
-        return action, dist.log_prob(action)
-    
-    def standardize(self, tensor):
-        return (tensor - tensor.mean()) / (tensor.std() +  self.eps)
+
+        #manage expo lr and linear decreasing
+        if ANNEAL_LR:
+            lam = lambda f: 1-f/(self.max_frames/self.num_steps)
+            # lam = lambda f: np.exp(-f / ((self.max_frames/self.num_steps) / -np.log(self.percent/100)))
+            ps = optim.lr_scheduler.LambdaLR(self.optimizer, 
+                                                    lr_lambda=lam)
+            # vs = optim.lr_scheduler.LambdaLR(self.val_opt, lr_lambda=lam)
+            self.SCHEDULER = ps
+
+            # self.params.VALUE_SCHEDULER = vs
  
-    def getDiscountedRewards(self):
-        discounted_rewards = []
-        reward = 0
-        for r in self.memory.rewards:
-            reward = r + self.gamma * reward
-            discounted_rewards.insert(0, reward)
-        #make sure dont need .float()
-        discounted_rewards = torch.FloatTensor(discounted_rewards)
-        return self.standardize(discounted_rewards) if self.regularize else discounted_rewards
+    def test_env(self, vis=False):
+        state = env.reset()
+        if vis: env.render()
+        done = False
+        total_reward = 0
+        while not done:
+            state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            dist = Categorical(self.model(state)[0])
+            next_state, reward, done, _ = env.step(dist.sample().cpu().numpy()[0])
+            state = next_state
+            if vis: env.render()
+            total_reward += reward
+        return total_reward
     
-    def run(self, q_val):
-        values = torch.stack(self.memory.values)
-        q_vals = np.zeros((len(self.memory), 1))
-        
-        # target values are calculated backward
-        # it's super important to handle correctly done states,
-        # for those cases we want our to target to be equal to the reward only
-        for i, (_, _, reward, done) in enumerate(self.memory.reversed()):
-            q_val = reward + self.gamma*q_val*(1.0-done)
-            q_vals[len(self.memory)-1 - i] = q_val # store values from the end to the beginning
+    #maybe ill move this ot memory al together.
+    def compute_returns(self, next_value, gamma=0.99):
+        R = next_value
+        returns = []
+        for step in reversed(range(len(self.memory))):
+            R = self.memory.rewards[step] + gamma * R * self.memory.masks[step]
+            returns.insert(0, R)
+        return returns
+    
+    def compute_gae(self, next_value, gamma=0.99, lam=0.97):
+        values = self.memory.values + [next_value]
+        gae = 0
+        returns = []
+        for step in reversed(range(len(self.memory))):
+            delta = self.memory.rewards[step] + gamma * values[step + 1] * self.memory.masks[step] - values[step]
+            gae = delta + gamma * lam * self.memory.masks[step] * gae
+            # prepend to get correct order back
+            returns.insert(0, gae + values[step])
+        return returns
+    #right now they all take a random action at the same time it might make sense for them to be
+    #independent
+    #somehow it learns even when eps is 1.0, which does make much sense to me, 
+    # could have to do with value function
+    def get_action_value(self, state, eps=0):
+        state = torch.FloatTensor(state).to(self.device)
+        probs, value = self.model(state)
+        dist = Categorical(probs)
+        if random.random() < eps:
+            action = torch.tensor(np.random.randint(self.action_space, size=len(self.envs)))
+        else:
+            action = dist.sample()
+        return action, dist, value
+
+    def surrogate_loss(self, next_value, entropy):
+        # returns = self.compute_returns(next_value)
+        returns = self.compute_gae(next_value)
             
-        advantage = torch.Tensor(q_vals) - values
-        
+        log_probs = torch.cat(self.memory.log_probs)
+        returns   = torch.cat(returns).detach()
+        values    = torch.cat(self.memory.values)
+
+        #not sure if the noramlzation is needed but ive seen it used
+        advantage = returns - values
+
+        actor_loss  = -(log_probs * advantage.detach()).mean()
         critic_loss = advantage.pow(2).mean()
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-        actor_loss = (-torch.stack(self.memory.log_probs)*advantage.detach()).mean()
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
 
-    def surrogate_loss(self):
-        #iterate over memory
-        values = torch.stack(self.memory.values)
-        discounted_rewards = self.getDiscountedRewards() * ~torch.tensor(self.memory.dones)
-        # print(self.memory.dones)
-        # print(discounted_rewards)
-        advantage = discounted_rewards - values
-        actor_loss = (-torch.stack(self.memory.log_probs)*advantage.detach()).mean()
-        critic_loss = advantage.pow(2).mean()
-        return actor_loss, critic_loss
-
-    def updateNetworks(self, last_val):
-
-        actor_loss, critic_loss = self.surrogate_loss()
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        self.critic_optimizer.step()
-        
-        self.actor_optimizer.zero_grad()
-        actor_loss.backward()
-        self.actor_optimizer.step()
-        
+        return actor_loss + 0.5 * critic_loss - 0.001 * entropy
 
     def train(self):
-        for i in range(self.n_episodes):
-            state, ep_reward = self.env.reset(), 0
-            done = False
-            #add max steps perhaps later
-            while not done:
-                #select action
-                action, log_prob_action = self.select_action(state)
-                #take step
-                next_state, reward, done, _ = self.env.step(action.item())
+        frame_idx = 0
+        #why envs.reset() here
+        state = envs.reset()
+        while frame_idx < self.max_frames:
+            # for param_group in self.optimizer.param_groups:
+            #     print(param_group['lr'])
+            # log_probs = []
+            # values    = []
+            # rewards   = []
+            # masks     = []
+            entropy = 0
+            # eps = 1.0 - frame_idx  / self.max_frames
+            # eps = epsilonLogDecay(frame_idx)
+            # print(eps)
+            for _ in range(self.num_steps):
+                action, dist, value = self.get_action_value(state, eps=0)
+                next_state, reward, done, _ = envs.step(action.cpu().numpy())
 
-                ep_reward += reward  
-                #add log_prob, value, reward, and done
-                self.memory.add(log_prob_action, self.critic(to_tensor(state)), reward, done)
+                log_prob = dist.log_prob(action)
+                entropy += dist.entropy().mean()
+                
+                self.memory.add(log_prob, 
+                                value, 
+                                torch.FloatTensor(reward).unsqueeze(1).to(self.device), 
+                                torch.FloatTensor(1 - done).unsqueeze(1).to(self.device))
+                # log_probs.append(log_prob)
+                # values.append(value)
+                # rewards.append(torch.FloatTensor(reward).unsqueeze(1).to(self.device))
+                # masks.append(torch.FloatTensor(1 - done).unsqueeze(1).to(self.device))
                 
                 state = next_state
+                frame_idx += 1
                 
-                # train if done or num steps > max_steps
-                if done or len(self.memory) >= self.n_step:
-                    last_val = self.critic(to_tensor(next_state)).detach().numpy()
-                    # self.updateNetworks(last_val)
-                    self.run(last_val)
-                    self.memory.clear()
-            
+                if frame_idx % 1000 == 0:
+                    print(frame_idx)
+                    mean = np.mean([self.test_env() for _ in range(10)])
+                    print(mean)
+                    self.test_rewards.append(mean)
+                    plot(frame_idx, self.test_rewards)
                     
-            self.reward_history.append(ep_reward)
-            if i % 10 == 0:
-                print(i, mean(self.reward_history[-10:]))
+            
+            
+            next_state = torch.FloatTensor(next_state).to(self.device)
+            _, next_value = self.model(next_state)
+            loss = self.surrogate_loss(next_value, entropy)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            self.SCHEDULER.step()
+            self.memory.clear()
         
-        plt.scatter(np.arange(len(self.reward_history)), self.reward_history, s=2)
-        plt.title("Total reward per episode (episodic)")
-        plt.ylabel("reward")
-        plt.xlabel("episode")
-        plt.show()
 
+#(self, env, envs, hidden_size, env_seed=0, torch_seed=0, ANNEAL_LR=True, device="cpu"):
 if __name__ == "__main__":
-    env = gym.make("CartPole-v1")
-    seed = 123
-    env.seed(seed)
-    agent = ActorCritic(env, seed)
+
+    device = get_device()  
+    #create a certain number of envs in the vector
+    num_envs = 8
+    env_name = "CartPole-v0" 
+
+    #figure out env vs envs
+    envs = make_envs(env_name, num_envs)
+    env = gym.make(env_name)
+
+    #seeds are not working maybe i need to set them for each of the sub envs...
+    agent = ACAgent(env, envs, [256], torch_seed=123, device=device)
     agent.train()
 
 
 
-
-
-    
-    
