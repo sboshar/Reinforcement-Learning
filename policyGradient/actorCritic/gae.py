@@ -50,6 +50,6 @@ def get_advantages(values, masks, rewards):
 if __name__ == "__main__":
     # print(compute_returns([1,1,2], [False, True, False]))
     print(calculate_returns([1,1,2], np.array([False, True, False]), 0.9, False))
-    print(compute_gae([1,1],[2], 
+    print(get_advantages([1,1],[2], 
 
 #advantage function estimators
