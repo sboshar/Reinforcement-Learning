@@ -174,6 +174,7 @@ class ACAgent:
             self.optimizer.step()
             self.SCHEDULER.step()
             self.memory.clear()
+        plot(frame_idx, self.test_rewards)
         
 
 #(self, env, envs, hidden_size, env_seed=0, torch_seed=0, ANNEAL_LR=True, device="cpu"):
